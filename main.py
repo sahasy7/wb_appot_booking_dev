@@ -6,6 +6,7 @@ import requests
 import json
 import os
 from dotenv import load_dotenv
+from azure.cosmos import CosmosClient
 
 load_dotenv()
 app = FastAPI()
@@ -24,11 +25,17 @@ CAL_HEADERS = {
     "cal-api-version": "2024-08-13"
 }
 
-print("🔑 CAL_API_KEY loaded:", bool(CAL_API_KEY))
-print("📅 EVENT_TYPE_ID:", EVENT_TYPE_ID)
+# ---------------- COSMOS DB ----------------
+COSMOS_URI = os.getenv("COSMOS_URI")
+COSMOS_KEY = os.getenv("COSMOS_KEY")
+COSMOS_DATABASE = os.getenv("COSMOS_DATABASE")
+COSMOS_SESSION_CONTAINER = os.getenv("COSMOS_SESSION_CONTAINER")
 
-# ---------------- STATE STORE ----------------
-STATE = {}
+cosmos_client = CosmosClient(COSMOS_URI, COSMOS_KEY)
+database = cosmos_client.get_database_client(COSMOS_DATABASE)
+session_container = database.get_container_client(COSMOS_SESSION_CONTAINER)
+
+SESSION_TTL = 1800  # 30 minutes
 
 # ---------------- REQUEST MODEL ----------------
 class SignalRequest(BaseModel):
@@ -37,8 +44,6 @@ class SignalRequest(BaseModel):
 
 # ---------------- RESPONSE FORMAT ----------------
 def response(action, message, status="PENDING", meta=None):
-    print(f"📤 RESPONSE | action={action} | status={status}")
-    print(f"📤 MESSAGE:\n{message}\n")
     return {
         "action": action,
         "message": message,
@@ -46,77 +51,89 @@ def response(action, message, status="PENDING", meta=None):
         "meta": meta or {}
     }
 
+# ---------------- COSMOS SESSION HELPERS ----------------
+def get_session(phone):
+    try:
+        doc = session_container.read_item(
+            item=f"session:{phone}",
+            partition_key=phone
+        )
+        return doc["state"]
+    except:
+        return None
+
+def save_session(phone, state):
+    session_container.upsert_item({
+        "id": f"session:{phone}",
+        "phone": phone,
+        "type": "appointment_session",
+        "state": state,
+        "updated_at": datetime.utcnow().isoformat(),
+        "ttl": SESSION_TTL
+    })
+
+def delete_session(phone):
+    try:
+        session_container.delete_item(
+            item=f"session:{phone}",
+            partition_key=phone
+        )
+    except:
+        pass
+
 # ---------------- FETCH REAL CAL SLOTS (MULTI-DAY FALLBACK) ----------------
 def get_available_slots_from_cal():
-    print("🕒 Fetching slots with multi-day fallback logic...")
-
     collected_slots = {}
     required_slots = 3
     days_ahead_limit = 7
 
     utc = pytz.utc
     ist = pytz.timezone(CAL_TIME_ZONE)
-
     current_date = datetime.now().date()
 
-    try:
-        for day_offset in range(days_ahead_limit):
+    for day_offset in range(days_ahead_limit):
+        if len(collected_slots) >= required_slots:
+            break
+
+        target_date = current_date + timedelta(days=day_offset)
+        date_str = target_date.isoformat()
+
+        res = requests.get(
+            CAL_SLOTS_URL,
+            headers={
+                "Authorization": f"Bearer {CAL_API_KEY}",
+                "cal-api-version": "2024-09-04"
+            },
+            params={
+                "eventTypeId": EVENT_TYPE_ID,
+                "start": date_str,
+                "end": date_str,
+                "timeZone": CAL_TIME_ZONE,
+                "format": "time"
+            }
+        )
+
+        if res.status_code != 200:
+            continue
+
+        data = res.json().get("data", {})
+        day_slots = data.get(date_str, [])
+
+        for slot in day_slots:
             if len(collected_slots) >= required_slots:
                 break
 
-            target_date = current_date + timedelta(days=day_offset)
-            date_str = target_date.isoformat()
+            iso_start = slot["start"]
+            dt_utc = datetime.fromisoformat(iso_start.replace("Z", "+00:00"))
+            dt_utc = dt_utc.replace(tzinfo=utc)
+            dt_ist = dt_utc.astimezone(ist)
 
-            print(f"📅 Checking slots for date: {date_str}")
+            collected_slots[str(len(collected_slots) + 1)] = {
+                "iso": iso_start,
+                "label": dt_ist.strftime("%d %b, %I:%M %p")
+            }
 
-            res = requests.get(
-                CAL_SLOTS_URL,
-                headers={
-                    "Authorization": f"Bearer {CAL_API_KEY}",
-                    "cal-api-version": "2024-09-04"
-                },
-                params={
-                    "eventTypeId": EVENT_TYPE_ID,
-                    "start": date_str,
-                    "end": date_str,
-                    "timeZone": CAL_TIME_ZONE,
-                    "format": "time"
-                }
-            )
-
-            if res.status_code != 200:
-                continue
-
-            data = res.json().get("data", {})
-            day_slots = data.get(date_str, [])
-
-            if not day_slots:
-                continue
-
-            for slot in day_slots:
-                if len(collected_slots) >= required_slots:
-                    break
-
-                iso_start = slot["start"]
-
-                dt_utc = datetime.fromisoformat(iso_start.replace("Z", "+00:00"))
-                dt_utc = dt_utc.replace(tzinfo=utc) if dt_utc.tzinfo is None else dt_utc
-                dt_ist = dt_utc.astimezone(ist)
-
-                label = dt_ist.strftime("%d %b, %I:%M %p")
-
-                slot_index = str(len(collected_slots) + 1)
-                collected_slots[slot_index] = {
-                    "iso": iso_start,
-                    "label": label
-                }
-
-        print("🧠 FINAL COLLECTED SLOTS:", collected_slots)
-        return collected_slots
-
-    except Exception as e:
-        print("❌ ERROR FETCHING SLOTS:", str(e))
-        return {}
+    return collected_slots
 
 # ---------------- CAL BOOKING ----------------
 def create_booking(name, email, start_iso):
@@ -131,18 +148,12 @@ def create_booking(name, email, start_iso):
         }
     }
 
-    print("📤 CAL BOOKING REQUEST PAYLOAD:")
-    print(json.dumps(payload, indent=2))
-
     res = requests.post(
         CAL_BOOKING_URL,
         headers=CAL_HEADERS,
         params={"apiKey": CAL_API_KEY},
         json=payload
     )
-
-    print("📥 CAL RESPONSE STATUS:", res.status_code)
-    print("📥 CAL RESPONSE BODY:", res.text)
 
     if res.status_code not in (200, 201):
         return None
@@ -155,18 +166,18 @@ def signal_handler(req: SignalRequest):
     phone = req.phone
     text = req.message.strip()
 
-    state = STATE.get(phone, {
+    state = get_session(phone) or {
         "name": None,
         "email": None,
         "slots": None,
         "stage": "ASK_NAME"
-    })
+    }
 
     # -------- STEP 1: NAME --------
     if state["stage"] == "ASK_NAME":
         state["name"] = text
         state["stage"] = "ASK_EMAIL"
-        STATE[phone] = state
+        save_session(phone, state)
         return response("SEND_MESSAGE", "Thanks 😊 Please share your email ID.")
 
     # -------- STEP 2: EMAIL --------
@@ -175,14 +186,11 @@ def signal_handler(req: SignalRequest):
 
         slot_map = get_available_slots_from_cal()
         if not slot_map:
-            return response(
-                "SEND_MESSAGE",
-                "⚠️ No slots available right now. Please try again later."
-            )
+            return response("SEND_MESSAGE", "⚠️ No slots available right now.")
 
         state["slots"] = slot_map
         state["stage"] = "ASK_SLOT"
-        STATE[phone] = state
+        save_session(phone, state)
 
         msg = "🕒 *Available slots:*\n\n"
         for k, v in slot_map.items():
@@ -194,60 +202,41 @@ def signal_handler(req: SignalRequest):
     # -------- STEP 3: SLOT --------
     if state["stage"] == "ASK_SLOT":
         if text not in state["slots"]:
-            return response(
-                "SEND_MESSAGE",
-                "❌ Invalid choice. Please reply with 1, 2, or 3."
-            )
+            return response("SEND_MESSAGE", "❌ Invalid choice.")
 
-        selected_slot = state["slots"][text]["iso"]
-        booking = create_booking(state["name"], state["email"], selected_slot)
+        booking = create_booking(
+            state["name"],
+            state["email"],
+            state["slots"][text]["iso"]
+        )
 
         if not booking:
-            return response(
-                "SEND_MESSAGE",
-                "⚠️ Failed to book appointment. Please try again."
-            )
+            return response("SEND_MESSAGE", "⚠️ Booking failed.")
 
-        data = booking.get("data", {})
-        meeting_url = data.get("meetingUrl") or data.get("location") or "Will be shared shortly"
-
+        data = booking["data"]
+        meeting_url = data.get("meetingUrl") or data.get("location")
         start_utc = data.get("start")
-        meeting_time_ist = "N/A"
 
-        if start_utc:
-            utc = pytz.utc
-            ist = pytz.timezone(CAL_TIME_ZONE)
+        utc = pytz.utc
+        ist = pytz.timezone(CAL_TIME_ZONE)
+        dt_ist = datetime.fromisoformat(start_utc.replace("Z", "+00:00")).replace(
+            tzinfo=utc
+        ).astimezone(ist)
 
-            dt_utc = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
-            dt_utc = dt_utc.replace(tzinfo=utc) if dt_utc.tzinfo is None else dt_utc
-            meeting_time_ist = dt_utc.astimezone(ist).strftime("%d %b %Y, %I:%M %p IST")
-
-        duration = data.get("duration", 30)
-        host_name = data.get("hosts", [{}])[0].get("name", "Host")
-
-        STATE.pop(phone, None)
+        delete_session(phone)
 
         return response(
             "SEND_MESSAGE",
             f"""✅ *Appointment Confirmed!*
 
-👤 *Attendee:* {state['name']}
+👤 *Name:* {state['name']}
 📧 *Email:* {state['email']}
-🧑‍💼 *Host:* {host_name}
-
-📅 *Date & Time:* {meeting_time_ist}
-⏱ *Duration:* {duration} minutes
+📅 *Time:* {dt_ist.strftime('%d %b %Y, %I:%M %p IST')}
 
 🔗 *Meeting Link:*
 {meeting_url}
-
-Looking forward to the meeting 😊""",
+""",
             status="BOOKED"
         )
 
-    return response(
-        "SEND_MESSAGE",
-        "Something went wrong. Please start again."
-    )
-
-
+    return response("SEND_MESSAGE", "Something went wrong. Please start again.")
