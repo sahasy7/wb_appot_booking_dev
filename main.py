@@ -81,7 +81,7 @@ def delete_session(phone):
     except:
         pass
 
-# ---------------- FETCH REAL CAL SLOTS (MULTI-DAY FALLBACK) ----------------
+# ---------------- FETCH CAL SLOTS (FIXED TIMEZONE) ----------------
 def get_available_slots_from_cal():
     collected_slots = {}
     required_slots = 3
@@ -89,7 +89,7 @@ def get_available_slots_from_cal():
 
     utc = pytz.utc
     ist = pytz.timezone(CAL_TIME_ZONE)
-    current_date = datetime.now().date()
+    current_date = datetime.now(ist).date()
 
     for day_offset in range(days_ahead_limit):
         if len(collected_slots) >= required_slots:
@@ -123,22 +123,29 @@ def get_available_slots_from_cal():
             if len(collected_slots) >= required_slots:
                 break
 
-            iso_start = slot["start"]
-            dt_utc = datetime.fromisoformat(iso_start.replace("Z", "+00:00"))
-            dt_utc = dt_utc.replace(tzinfo=utc)
+            # Slot start comes in UTC
+            iso_start_utc = slot["start"]
+            dt_utc = datetime.fromisoformat(
+                iso_start_utc.replace("Z", "+00:00")
+            ).astimezone(utc)
+
+            # Convert to IST for display
             dt_ist = dt_utc.astimezone(ist)
 
+            # Convert BACK to UTC (authoritative booking value)
+            dt_utc_corrected = dt_ist.astimezone(utc)
+
             collected_slots[str(len(collected_slots) + 1)] = {
-                "iso": iso_start,
+                "iso": dt_utc_corrected.isoformat().replace("+00:00", "Z"),
                 "label": dt_ist.strftime("%d %b, %I:%M %p")
             }
 
     return collected_slots
 
 # ---------------- CAL BOOKING ----------------
-def create_booking(name, email, start_iso):
+def create_booking(name, email, start_iso_utc):
     payload = {
-        "start": start_iso,
+        "start": start_iso_utc,  # MUST be UTC
         "eventTypeId": EVENT_TYPE_ID,
         "metadata": {},
         "attendee": {
@@ -192,7 +199,7 @@ def signal_handler(req: SignalRequest):
         state["stage"] = "ASK_SLOT"
         save_session(phone, state)
 
-        msg = "🕒 *Available slots:*\n\n"
+        msg = "🕒 *Available slots (IST):*\n\n"
         for k, v in slot_map.items():
             msg += f"{k}. {v['label']}\n"
 
@@ -219,9 +226,10 @@ def signal_handler(req: SignalRequest):
 
         utc = pytz.utc
         ist = pytz.timezone(CAL_TIME_ZONE)
-        dt_ist = datetime.fromisoformat(start_utc.replace("Z", "+00:00")).replace(
-            tzinfo=utc
-        ).astimezone(ist)
+
+        dt_ist = datetime.fromisoformat(
+            start_utc.replace("Z", "+00:00")
+        ).astimezone(utc).astimezone(ist)
 
         delete_session(phone)
 
@@ -240,3 +248,4 @@ def signal_handler(req: SignalRequest):
         )
 
     return response("SEND_MESSAGE", "Something went wrong. Please start again.")
+
