@@ -6,6 +6,7 @@ import requests
 import os
 from dotenv import load_dotenv
 from azure.cosmos import CosmosClient
+import dateparser
 
 load_dotenv()
 app = FastAPI()
@@ -24,6 +25,8 @@ CAL_HEADERS = {
     "cal-api-version": "2024-08-13"
 }
 
+BOOKING_WINDOW_DAYS = 30
+
 # ---------------- COSMOS DB ----------------
 COSMOS_URI = os.getenv("COSMOS_URI")
 COSMOS_KEY = os.getenv("COSMOS_KEY")
@@ -34,7 +37,7 @@ cosmos_client = CosmosClient(COSMOS_URI, COSMOS_KEY)
 database = cosmos_client.get_database_client(COSMOS_DATABASE)
 session_container = database.get_container_client(COSMOS_SESSION_CONTAINER)
 
-SESSION_TTL = 1800  # 30 mins
+SESSION_TTL = 1800  # 30 minutes
 
 # ---------------- REQUEST MODEL ----------------
 class SignalRequest(BaseModel):
@@ -80,30 +83,37 @@ def delete_session(phone):
     except:
         pass
 
-# ---------------- DATE PARSER ----------------
+# ---------------- NATURAL LANGUAGE DATE PARSER ----------------
 def parse_user_date(text):
     ist = pytz.timezone(CAL_TIME_ZONE)
-    today = datetime.now(ist).date()
-    text = text.lower().strip()
+    now = datetime.now(ist)
 
-    if text in ["today"]:
-        return today
-    if text in ["tomorrow"]:
-        return today + timedelta(days=1)
+    parsed = dateparser.parse(
+        text,
+        settings={
+            "PREFER_DATES_FROM": "future",
+            "RELATIVE_BASE": now,
+            "TIMEZONE": CAL_TIME_ZONE,
+            "RETURN_AS_TIMEZONE_AWARE": True
+        }
+    )
 
-    try:
-        parsed = datetime.fromisoformat(text).date()
-        return parsed
-    except:
-        pass
+    if not parsed:
+        return None
 
-    return None
+    parsed_date = parsed.astimezone(ist).date()
+
+    if parsed_date < now.date():
+        return None
+    if parsed_date > now.date() + timedelta(days=BOOKING_WINDOW_DAYS):
+        return None
+
+    return parsed_date
 
 # ---------------- FETCH SLOTS FOR A DATE ----------------
 def get_slots_for_date(target_date):
     ist = pytz.timezone(CAL_TIME_ZONE)
     utc = pytz.utc
-
     date_str = target_date.isoformat()
 
     res = requests.get(
@@ -140,6 +150,15 @@ def get_slots_for_date(target_date):
 
     return slot_map
 
+# ---------------- AUTO-SUGGEST NEXT AVAILABLE DATE ----------------
+def find_next_available_date(start_date):
+    for i in range(1, BOOKING_WINDOW_DAYS + 1):
+        next_date = start_date + timedelta(days=i)
+        slots = get_slots_for_date(next_date)
+        if slots:
+            return next_date, slots
+    return None, {}
+
 # ---------------- CAL BOOKING ----------------
 def create_booking(name, email, start_iso_utc):
     payload = {
@@ -168,59 +187,80 @@ def create_booking(name, email, start_iso_utc):
 @app.post("/signal")
 def signal_handler(req: SignalRequest):
     phone = req.phone
-    text = req.message.strip()
+    text = req.message.strip().lower()
 
     state = get_session(phone) or {
         "name": None,
         "email": None,
         "date": None,
         "slots": None,
+        "selected_slot": None,
         "stage": "ASK_NAME"
     }
 
     # -------- STEP 1: NAME --------
     if state["stage"] == "ASK_NAME":
-        state["name"] = text
+        state["name"] = req.message.strip()
         state["stage"] = "ASK_EMAIL"
         save_session(phone, state)
         return response("SEND_MESSAGE", "Thanks 😊 Please share your email ID.")
 
     # -------- STEP 2: EMAIL --------
     if state["stage"] == "ASK_EMAIL":
-        state["email"] = text
+        state["email"] = req.message.strip()
         state["stage"] = "ASK_DATE"
         save_session(phone, state)
 
         return response(
             "SEND_MESSAGE",
-            "📅 Which date would you prefer?\n\nYou can reply with:\n• *today*\n• *tomorrow*\n• *YYYY-MM-DD*"
+            "📅 Which date would you prefer?\n\n"
+            "You can say:\n"
+            "• today / tomorrow\n"
+            "• 23rd / 23 Feb\n"
+            "• this Friday / next Monday"
         )
 
     # -------- STEP 3: DATE --------
     if state["stage"] == "ASK_DATE":
-        selected_date = parse_user_date(text)
+        selected_date = parse_user_date(req.message)
 
         if not selected_date:
-            return response("SEND_MESSAGE", "❌ Please enter a valid date.")
+            return response(
+                "SEND_MESSAGE",
+                "❌ I couldn’t understand the date. Please try something like *23rd*, *tomorrow*, or *next Monday*."
+            )
 
         slots = get_slots_for_date(selected_date)
 
         if not slots:
-            return response(
-                "SEND_MESSAGE",
-                "⚠️ No slots available on that date. Please try another date."
+            next_date, next_slots = find_next_available_date(selected_date)
+
+            if not next_date:
+                return response(
+                    "SEND_MESSAGE",
+                    "⚠️ No availability in the next 30 days. Please try later."
+                )
+
+            state["date"] = next_date.isoformat()
+            state["slots"] = next_slots
+            state["stage"] = "ASK_SLOT"
+            save_session(phone, state)
+
+            msg = (
+                f"⚠️ No slots on *{selected_date.strftime('%d %b')}*.\n\n"
+                f"✅ Next available date is *{next_date.strftime('%d %b')}*:\n\n"
             )
+        else:
+            state["date"] = selected_date.isoformat()
+            state["slots"] = slots
+            state["stage"] = "ASK_SLOT"
+            save_session(phone, state)
+            msg = "🕒 *Available slots (IST):*\n\n"
 
-        state["date"] = selected_date.isoformat()
-        state["slots"] = slots
-        state["stage"] = "ASK_SLOT"
-        save_session(phone, state)
-
-        msg = "🕒 *Available slots (IST):*\n\n"
-        for k, v in slots.items():
+        for k, v in state["slots"].items():
             msg += f"{k}. {v['label']}\n"
-        msg += "\nReply with *1, 2, or 3*."
 
+        msg += "\nReply with *1, 2, or 3*."
         return response("SEND_MESSAGE", msg)
 
     # -------- STEP 4: SLOT --------
@@ -228,10 +268,35 @@ def signal_handler(req: SignalRequest):
         if text not in state["slots"]:
             return response("SEND_MESSAGE", "❌ Invalid choice.")
 
+        state["selected_slot"] = state["slots"][text]
+        state["stage"] = "CONFIRM_BOOKING"
+        save_session(phone, state)
+
+        return response(
+            "SEND_MESSAGE",
+            f"""✅ *Please confirm your booking*
+
+👤 {state['name']}
+📧 {state['email']}
+📅 {state['selected_slot']['label']} IST
+
+Reply with *YES* to confirm or *NO* to change the date."""
+        )
+
+    # -------- STEP 5: CONFIRMATION --------
+    if state["stage"] == "CONFIRM_BOOKING":
+        if text == "no":
+            state["stage"] = "ASK_DATE"
+            save_session(phone, state)
+            return response("SEND_MESSAGE", "Okay 👍 Please share a new preferred date.")
+
+        if text != "yes":
+            return response("SEND_MESSAGE", "Please reply with *YES* or *NO*.")
+
         booking = create_booking(
             state["name"],
             state["email"],
-            state["slots"][text]["iso"]
+            state["selected_slot"]["iso"]
         )
 
         if not booking:
@@ -250,7 +315,7 @@ def signal_handler(req: SignalRequest):
 
         return response(
             "SEND_MESSAGE",
-            f"""✅ *Appointment Confirmed!*
+            f"""🎉 *Appointment Confirmed!*
 
 👤 *Name:* {state['name']}
 📧 *Email:* {state['email']}
