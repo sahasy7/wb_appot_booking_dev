@@ -3,7 +3,6 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 import pytz
 import requests
-import json
 import os
 from dotenv import load_dotenv
 from azure.cosmos import CosmosClient
@@ -35,7 +34,7 @@ cosmos_client = CosmosClient(COSMOS_URI, COSMOS_KEY)
 database = cosmos_client.get_database_client(COSMOS_DATABASE)
 session_container = database.get_container_client(COSMOS_SESSION_CONTAINER)
 
-SESSION_TTL = 1800  # 30 minutes
+SESSION_TTL = 1800  # 30 mins
 
 # ---------------- REQUEST MODEL ----------------
 class SignalRequest(BaseModel):
@@ -51,7 +50,7 @@ def response(action, message, status="PENDING", meta=None):
         "meta": meta or {}
     }
 
-# ---------------- COSMOS SESSION HELPERS ----------------
+# ---------------- SESSION HELPERS ----------------
 def get_session(phone):
     try:
         doc = session_container.read_item(
@@ -81,73 +80,71 @@ def delete_session(phone):
     except:
         pass
 
-# ---------------- FETCH CAL SLOTS (FIXED TIMEZONE) ----------------
-def get_available_slots_from_cal():
-    collected_slots = {}
-    required_slots = 3
-    days_ahead_limit = 7
-
-    utc = pytz.utc
+# ---------------- DATE PARSER ----------------
+def parse_user_date(text):
     ist = pytz.timezone(CAL_TIME_ZONE)
-    current_date = datetime.now(ist).date()
+    today = datetime.now(ist).date()
+    text = text.lower().strip()
 
-    for day_offset in range(days_ahead_limit):
-        if len(collected_slots) >= required_slots:
-            break
+    if text in ["today"]:
+        return today
+    if text in ["tomorrow"]:
+        return today + timedelta(days=1)
 
-        target_date = current_date + timedelta(days=day_offset)
-        date_str = target_date.isoformat()
+    try:
+        parsed = datetime.fromisoformat(text).date()
+        return parsed
+    except:
+        pass
 
-        res = requests.get(
-            CAL_SLOTS_URL,
-            headers={
-                "Authorization": f"Bearer {CAL_API_KEY}",
-                "cal-api-version": "2024-09-04"
-            },
-            params={
-                "eventTypeId": EVENT_TYPE_ID,
-                "start": date_str,
-                "end": date_str,
-                "timeZone": CAL_TIME_ZONE,
-                "format": "time"
-            }
-        )
+    return None
 
-        if res.status_code != 200:
-            continue
+# ---------------- FETCH SLOTS FOR A DATE ----------------
+def get_slots_for_date(target_date):
+    ist = pytz.timezone(CAL_TIME_ZONE)
+    utc = pytz.utc
 
-        data = res.json().get("data", {})
-        day_slots = data.get(date_str, [])
+    date_str = target_date.isoformat()
 
-        for slot in day_slots:
-            if len(collected_slots) >= required_slots:
-                break
+    res = requests.get(
+        CAL_SLOTS_URL,
+        headers={
+            "Authorization": f"Bearer {CAL_API_KEY}",
+            "cal-api-version": "2024-09-04"
+        },
+        params={
+            "eventTypeId": EVENT_TYPE_ID,
+            "start": date_str,
+            "end": date_str,
+            "timeZone": CAL_TIME_ZONE,
+            "format": "time"
+        }
+    )
 
-            # Slot start comes in UTC
-            iso_start_utc = slot["start"]
-            dt_utc = datetime.fromisoformat(
-                iso_start_utc.replace("Z", "+00:00")
-            ).astimezone(utc)
+    if res.status_code != 200:
+        return {}
 
-            # Convert to IST for display
-            dt_ist = dt_utc.astimezone(ist)
+    slots = res.json().get("data", {}).get(date_str, [])
+    slot_map = {}
 
-            # Convert BACK to UTC (authoritative booking value)
-            dt_utc_corrected = dt_ist.astimezone(utc)
+    for slot in slots[:3]:
+        iso_utc = slot["start"]
+        dt_ist = datetime.fromisoformat(
+            iso_utc.replace("Z", "+00:00")
+        ).astimezone(utc).astimezone(ist)
 
-            collected_slots[str(len(collected_slots) + 1)] = {
-                "iso": dt_utc_corrected.isoformat().replace("+00:00", "Z"),
-                "label": dt_ist.strftime("%d %b, %I:%M %p")
-            }
+        slot_map[str(len(slot_map) + 1)] = {
+            "iso": iso_utc,
+            "label": dt_ist.strftime("%d %b, %I:%M %p")
+        }
 
-    return collected_slots
+    return slot_map
 
 # ---------------- CAL BOOKING ----------------
 def create_booking(name, email, start_iso_utc):
     payload = {
-        "start": start_iso_utc,  # MUST be UTC
+        "start": start_iso_utc,
         "eventTypeId": EVENT_TYPE_ID,
-        "metadata": {},
         "attendee": {
             "name": name,
             "email": email,
@@ -176,6 +173,7 @@ def signal_handler(req: SignalRequest):
     state = get_session(phone) or {
         "name": None,
         "email": None,
+        "date": None,
         "slots": None,
         "stage": "ASK_NAME"
     }
@@ -190,23 +188,42 @@ def signal_handler(req: SignalRequest):
     # -------- STEP 2: EMAIL --------
     if state["stage"] == "ASK_EMAIL":
         state["email"] = text
+        state["stage"] = "ASK_DATE"
+        save_session(phone, state)
 
-        slot_map = get_available_slots_from_cal()
-        if not slot_map:
-            return response("SEND_MESSAGE", "⚠️ No slots available right now.")
+        return response(
+            "SEND_MESSAGE",
+            "📅 Which date would you prefer?\n\nYou can reply with:\n• *today*\n• *tomorrow*\n• *YYYY-MM-DD*"
+        )
 
-        state["slots"] = slot_map
+    # -------- STEP 3: DATE --------
+    if state["stage"] == "ASK_DATE":
+        selected_date = parse_user_date(text)
+
+        if not selected_date:
+            return response("SEND_MESSAGE", "❌ Please enter a valid date.")
+
+        slots = get_slots_for_date(selected_date)
+
+        if not slots:
+            return response(
+                "SEND_MESSAGE",
+                "⚠️ No slots available on that date. Please try another date."
+            )
+
+        state["date"] = selected_date.isoformat()
+        state["slots"] = slots
         state["stage"] = "ASK_SLOT"
         save_session(phone, state)
 
         msg = "🕒 *Available slots (IST):*\n\n"
-        for k, v in slot_map.items():
+        for k, v in slots.items():
             msg += f"{k}. {v['label']}\n"
-
         msg += "\nReply with *1, 2, or 3*."
+
         return response("SEND_MESSAGE", msg)
 
-    # -------- STEP 3: SLOT --------
+    # -------- STEP 4: SLOT --------
     if state["stage"] == "ASK_SLOT":
         if text not in state["slots"]:
             return response("SEND_MESSAGE", "❌ Invalid choice.")
@@ -224,12 +241,10 @@ def signal_handler(req: SignalRequest):
         meeting_url = data.get("meetingUrl") or data.get("location")
         start_utc = data.get("start")
 
-        utc = pytz.utc
         ist = pytz.timezone(CAL_TIME_ZONE)
-
         dt_ist = datetime.fromisoformat(
             start_utc.replace("Z", "+00:00")
-        ).astimezone(utc).astimezone(ist)
+        ).astimezone(pytz.utc).astimezone(ist)
 
         delete_session(phone)
 
@@ -248,4 +263,3 @@ def signal_handler(req: SignalRequest):
         )
 
     return response("SEND_MESSAGE", "Something went wrong. Please start again.")
-
